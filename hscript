@@ -1,0 +1,595 @@
+#!/usr/bin/env bash
+
+
+FORCE=false
+DEBUG=false
+REMOTE=false
+BLUEPRINT="blueprint-raw-all.json"
+YARN=false
+while getopts ":b:e:fdry" Option
+# Initial declaration.
+# a, b, c, d, e, f, and g are the flags expected.
+# The : after flag 'e' shows it will have an option passed with it.
+do
+  case $Option in
+#	w ) CMD=$OPTARG; FILENAME="PIMSLogList.txt"; TARGET="logfiles"; ;;
+    e ) email_contact=$OPTARG ;;
+    y ) BLUEPRINT="blueprint-raw-minimal.json" ;;
+    b ) BLUEPRINT=$OPTARG ;;
+	f ) FORCE=true ;;
+	d ) DEBUG=true ;;
+    r ) REMOTE=true ;;
+	* ) echo "Not recognized argument"; exit -1  ;;
+    
+  esac
+done
+shift $(($OPTIND - 1))
+
+if [ -f HADOOP-SINGLE-NODE-CLUSTER ] ; then
+    cat HADOOP-SINGLE-NODE-CLUSTER
+else
+    if [ "$REMOTE" == "true" ] ; then
+        curl -s https://raw.githubusercontent.com/DemandCube/hadoop-single-node-cluster/master/HADOOP-SINGLE-NODE-CLUSTER
+        echo ""
+    fi
+fi
+printf "\n\n"
+
+sleep 1
+
+# Check memory and if it's low warn the user
+ram=$(free -l | head -n 2 | tail -n 1 | awk '{print $2}')
+if [ "$ram" == "" ] ; then
+    echo "WARNING: Problem checking how much ram you have."
+else
+    # test if machine has 4 gigs
+    if [ $ram -lt 4194304 ] ; then
+        echo "WARNING NOT ENOUGH MEMORY"
+        echo "You have $(free -lg | head -n 2 | tail -n 1 | awk '{print $2}') gig of RAM"
+        echo ""
+        echo "RECOMMENDED: Minimum of 4 Gigs of RAM or will probably fail"
+        echo ""
+        if [ "$FORCE" == "false" ] ; then
+            echo "Use: argument -f to force"
+            exit 1;
+        fi
+    fi
+fi
+
+
+
+if [ $UID -ne 0 ] ; then
+    echo "WARNING NOT BEING RUN AS ROOT"
+    echo ""
+    echo "RECOMMENDED: Run only as root, only tested that way."
+    echo ""
+    if [ "$FORCE" == "false" ] ; then
+        echo "Use: argument -f to force"
+        exit 1;
+    fi
+fi
+
+
+if [ -f /etc/redhat-release ] ; then
+    echo "Using OS:"
+    cat /etc/redhat-release
+else
+    echo "WARNING this is only tested on CENTOS this may not work"
+    printf "\n\n"
+    if [ "$FORCE" == "false" ] ; then
+        echo "Use: argument -f to force"
+        exit 1;
+    fi
+fi
+
+
+# email_contact=$1 # nagios wants the sysadmin's email address
+if [[ $email_contact == "" ]] ; then
+    echo "Usage: create_cluster.sh [someone@example.com]"
+    echo "Optionally supply a contact email for Nagios monitoring."
+
+    email_contact='nobody@noop.com'
+    echo "Using default email for nagios: ${email_contact}"
+    echo "Add argument to custom install email"
+fi
+
+
+function check_http_status(){
+    url=$1
+    target_status=$2
+    local retstatus=0
+    actual_status=$(curl -o /dev/null -s -w %{http_code} $url)
+    
+    if [[ $target_status == $actual_status ]]; then
+            #echo "Target status matched."
+            retstatus=0
+    else
+            #echo "Target status $target_status not equal to $actual_status"
+            retstatus=1
+    fi
+    return $retstatus
+}
+
+function check_ambari() {
+    local ambari_status=0
+    local ps_ran=1
+    if [ -f /var/run/ambari-server/ambari-server.pid ] ; then
+        ps -p `cat /var/run/ambari-server/ambari-server.pid` &> /dev/null
+    else
+        ps_ran=0
+    fi
+
+    if [ $? -ne 0 ] || [ $ps_ran -eq 0 ]  ; then
+        # Count 1 is not found
+        # Count 2 is the search and process found
+        PROCESS_CHECK=$(ps aux | grep org.apache.ambari.server.controller.AmbariServer | wc -l)
+        if [ $PROCESS_CHECK -lt 2 ] ; then
+            # Ambari's not running
+            ambari_status=1
+        fi
+    fi
+    return $ambari_status
+}
+
+
+function wait_until_some_http_status () {
+    local url=$1
+    local target_status=$2
+    local check_ambari_running=$3
+    local s=0
+    local spinstr='|/-\'
+    local clean_spin=0
+    local seconds_past=0
+
+
+    while [[ $s != $target_status ]]
+        do
+            if [ "x$check_ambari_running" == "xtrue" ] ; then
+                check_ambari
+                if [ $? -ne 0 ] ; then
+                    echo "Ambari stopped running ending the loop"
+                    exit 1
+                fi
+            fi
+            s=$(curl -o /dev/null -s -w %{http_code} $url)
+            if [[ $s == "000" ]]
+                then
+                    if [ ${REMOTE:-false} == "false" ] ; then  
+                        if [ $clean_spin -eq 1 ] ; then
+                            printf "\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b"
+                        fi
+                        local temp=${spinstr#?}
+                        printf "no response from server - [%c]  " "$spinstr"
+                        local spinstr=$temp${spinstr%"$temp"}
+                        clean_spin=1
+                    else 
+                        echo "<no response from server>"
+                    fi
+                else
+                    echo "HTTP status: $s"
+            fi
+            sleep 2
+            let "seconds_past=$seconds_past+2"
+            
+            if [ $seconds_past -gt 120 ] ; then
+                echo "waiting for ambari more than 2 minutes"
+                echo "exiting now"
+                exit 1
+            fi
+
+        done
+}
+
+spinner()
+{
+    local thetime=$1
+    local delay=0.75
+    local spinstr='|/-\'
+    for (( c=0 ; c<=$thetime ; c++ )) {
+        local temp=${spinstr#?}
+        printf " [%c]  " "$spinstr"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep $delay
+        printf "\b\b\b\b\b\b"
+    }
+    printf "    \b\b\b\b"
+}
+
+echo "First install and start needed services"
+sudo yum install -y ntp ntpdate ntp-doc  # in many installs, ex. RHEL EC2 AMI, we already have ntpd and ntpupdate installed
+sudo chkconfig ntpd on
+sudo service ntpd restart
+
+sudo chkconfig iptables off
+sudo /etc/init.d/iptables stop
+sudo chkconfig ip6tables off
+sudo /etc/init.d/ip6tables stop
+
+sudo yum update openssl.x86_64 -y
+
+echo "The version of openssl.x86_64:"
+yum list installed openssl.x86_64 | tail -n 1 | awk '{print $2}'
+
+echo "openssl:"
+echo "Good Version: 1.0.1e-16.el6_5.14 - (Known to work)"
+echo "Bad Version: 1.0.1e-15.el6 - (Known to cause ambari agents to not register)"
+
+
+# ---> Package openssl.x86_64 0:1.0.1e-15.el6 will be updated
+# ---> Package openssl.x86_64 0:1.0.1e-16.el6_5.14 will be an update
+
+echo "To get ambari with yum we need the Hortonworks repo"
+
+# Old code using wget - replaced with the curl equivalent
+# sudo yum install -y wget
+# sudo wget -c -P /etc/yum.repos.d/ http://public-repo-1.hortonworks.com/ambari/centos6/1.x/updates/1.6.0/ambari.repo
+
+curl --create-dirs -C - -o /etc/yum.repos.d/ambari.repo http://public-repo-1.hortonworks.com/ambari/centos6/1.x/updates/1.6.0/ambari.repo
+sudo yum -y install ambari-server ambari-agent
+
+# hostname -f
+# hostname
+# uname -n
+# /etc/sysconfig/network
+# /etc/hosts
+# /etc/hostname
+
+my_fqdn=$(python -c 'from socket import getfqdn; print getfqdn()')
+echo "FQDN:$my_fqdn"
+# Internally Ambari uses the following to get it's hostname
+# >>> import socket
+# >>> socket.getfqdn()
+# 'localhost.localdomain'
+
+ping -c 1 $my_fqdn
+
+if [ ! $? -eq 0 ] ; then
+my_fqdn=$(hostname)
+
+# get the main ip address
+# this gets the ip address that would be used to route to ip 8.8.8.8
+my_ip=`ip route get 8.8.8.8 | awk 'NR==1 {print $NF}'`
+my_short_fqdn=$my_fqdn
+my_long_fqdn="${my_short_fqdn}.sandbox.neverwinterdp.com"
+
+echo "FQDN:$my_fqdn"
+echo "127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4" > /etc/hosts
+echo "::1         localhost localhost.localdomain localhost6 localhost6.localdomain6" >> /etc/hosts
+echo "$my_ip      ${my_long_fqdn} $my_fqdn" >> /etc/hosts
+my_fqdn=$my_long_fqdn
+fi
+echo "FQDN:$my_fqdn"
+
+
+sudo ambari-agent restart
+sudo ambari-server setup -v -s
+sudo ambari-server restart
+
+TMP_DIR=/tmp
+
+echo "Replace the dummy email address in the blueprint JSON file with the specified email address"
+
+if [ "$REMOTE" == "true" ] ; then
+    curl -s https://raw.githubusercontent.com/DemandCube/hadoop-single-node-cluster/master/$BLUEPRINT | sed s/NAGIOS_CONTACT_GOES_HERE/$email_contact/ > $TMP_DIR/blueprint.json
+else
+    sed s/NAGIOS_CONTACT_GOES_HERE/$email_contact/ $BLUEPRINT > $TMP_DIR/blueprint.json    
+fi
+
+
+echo "Trying http://localhost:8080/api/v1/blueprints to confirm Ambari server is up..."
+wait_until_some_http_status "http://admin:admin@localhost:8080/api/v1/blueprints" "200"
+sleep 2 # wait a few moments longer just to let the server settle down
+
+echo "Add the blueprint.json blueprint file to our Ambari server's available blueprints"
+curl -v -X POST -d @$TMP_DIR/blueprint.json http://admin:admin@localhost:8080/api/v1/blueprints/bp-all-services --header "Content-Type:application/json" --header "X-Requested-By:mycompany"
+
+echo "Trying http://localhost:8080/api/v1/clusters to confirm Ambari server is still up..."
+wait_until_some_http_status "http://admin:admin@localhost:8080/api/v1/clusters" "200" "true"
+
+echo "Replacing the dummy hostname in the cluster creation JSON file with this host's fully qualified domain name"
+# now set above
+# my_fqdn=$(hostname -f)
+
+if [ "$REMOTE" == "true" ] ; then
+    curl -s https://raw.githubusercontent.com/DemandCube/hadoop-single-node-cluster/master/cluster-creation-raw.json | sed s/FQDN_GOES_HERE/$my_fqdn/ > $TMP_DIR/cluster-creation.json
+else
+    sed s/FQDN_GOES_HERE/$my_fqdn/ cluster-creation-raw.json > $TMP_DIR/cluster-creation.json
+fi
+
+echo ""
+echo "Pausing for 30 seconds to let Ambari server settle down"
+
+if [ "$REMOTE" == "true" ] ; then
+    sleep 30
+else
+    spinner 40
+fi
+
+
+#if cluster already exists delete it
+
+# Code by Anthony doesn't work
+# if check_http_status  '-H "X-Requested-By: ambari" -u admin:admin -i  http://localhost:8080/api/v1/clusters/cl1' 200; then
+#     echo "Cluster [cl1] already exists - deleting it"
+#     curl -H "X-Requested-By: ambari" -u admin:admin -i -X DELETE http://localhost:8080/api/v1/clusters/cl1
+# fi
+
+check_http_status  ' -u admin:admin -i  http://localhost:8080/api/v1/clusters/cl1' 200
+
+if [ $? -eq 0 ] ; then
+    # curl -o /dev/null -s -w %{http_code} 
+    echo "Cluster [cl1] already exists - deleting it"
+    curl -H "X-Requested-By: ambari" -u admin:admin -i -X DELETE http://localhost:8080/api/v1/clusters/cl1
+fi
+
+echo ""
+echo "Printing to see if the blueprint exists"
+echo ""
+
+curl http://admin:admin@localhost:8080/api/v1/blueprints/bp-all-services
+
+echo ""
+echo "Printing to see what register agent hosts exist"
+echo ""
+
+curl -uadmin:admin http://localhost:8080/api/v1/hosts
+
+
+TEST_HOST=`curl -s -uadmin:admin http://localhost:8080/api/v1/hosts | grep $my_fqdn | grep host_name | awk '{print $3}' | tr -d [\"] | wc -l`
+
+if [ $TEST_HOST -ne 1 ] ; then
+    echo "WARNING: Ambari agent host isn't registered please investigate"
+    echo "In the pass have found it to be an ssl error"
+    echo "curl -uadmin:admin http://localhost:8080/api/v1/hosts"
+fi
+
+
+echo "Now cause a cluster to be created with our loaded blueprint"
+curl -v -X POST -d @$TMP_DIR/cluster-creation.json http://admin:admin@localhost:8080/api/v1/clusters/cl1 --header "Content-Type:application/json" --header "X-Requested-By:mycompany"
+echo ""
+echo ""
+echo "Cluster creation should now be in process. This script will now monitor it until completion. You can also point your browser to localhost:8080 and log in as admin:admin to monitor it yourself."
+echo ""
+# This gets COMPLETED when done
+# curl -s -uadmin:admin http://localhost:8080/api/v1/clusters/cl1/requests/1?fields=Requests/request_status | grep request_status | awk '{print $3}' | tr -d [\"]
+
+
+CHECK_STATUS=true
+LOOP_SECONDS=0
+
+AMBARI_RESTARTS=0
+
+while [[ "$CHECK_STATUS" == "true" ]] ; do
+    
+    CMD_CLUSTER_STATUS='curl -uadmin:admin -o /dev/null -s -w %{http_code} http://localhost:8080/api/v1/clusters/cl1/requests/1?fields=Requests/request_status'
+    CMD_CLUSTER_RESULTS='curl -s -uadmin:admin http://localhost:8080/api/v1/clusters/cl1/requests/1?fields=Requests/request_status'
+    CMD_CLUSTER_RESULTS_SECTION='curl -s -uadmin:admin http://localhost:8080/api/v1/clusters/cl1/requests/1?fields=Requests'
+    CMD_CLUSTER_TASK_SECTION='curl -s -uadmin:admin http://localhost:8080/api/v1/clusters/cl1/requests/1?fields=tasks/Tasks/*'
+        
+    CLUSTER_STATUS=`$CMD_CLUSTER_STATUS`
+    CLUSTER_RESULTS=`$CMD_CLUSTER_RESULTS`
+    CLUSTER_RESULTS_STATUS=`echo "$CLUSTER_RESULTS" | grep request_status | awk '{print $3}' | tr -d [\"]`
+    
+    CLUSTER_TASK_RESULTS=`$CMD_CLUSTER_TASK_SECTION`
+    CLUSTER_RESULTS_SECTION=`$CMD_CLUSTER_RESULTS_SECTION`
+    
+    CLUSTER_RESULTS_COMPLETED=`echo "$CLUSTER_RESULTS_SECTION" | grep completed_task_count | awk '{print $3}' | tr -d [\",]`
+    CLUSTER_RESULTS_TASKS=`echo "$CLUSTER_RESULTS_SECTION" | grep \"task_count | awk '{print $3}' | tr -d [\",]`
+    # echo "$CLUSTER_STATUS"
+    # echo "$CLUSTER_RESULTS_STATUS"
+    
+    # Test if ambari server dies
+    # /var/run/ambari-server/ambari-server.pid
+    
+    echo "Total Tasks:$CLUSTER_RESULTS_TASKS Tasks Completed:$CLUSTER_RESULTS_COMPLETED"
+    
+    ps -p `cat /var/run/ambari-server/ambari-server.pid` > /dev/null
+    
+    if [ $? -ne 0 ] ; then
+        echo "Problem finding ambari running with pid file."
+        if [ -f /var/run/ambari-server/ambari-server.pid ] ; then
+            echo "Pid file is missing."
+        else
+            echo "found pid file but process is missing"
+        fi
+        # Count 1 is not found
+        # Count 2 is the search and process found
+        PROCESS_CHECK=$(ps aux | grep org.apache.ambari.server.controller.AmbariServer | wc -l)
+        if [ $PROCESS_CHECK -lt 2 ] ; then
+            echo "Ambari's not running restarting"
+            sleep 10
+            /etc/init.d/ambari-server start
+            AMBARI_RESTARTS=$AMBARI_RESTARTS+1
+            if [ $AMBARI_RESTARTS -ge 2 ] ; then
+                echo "restarted ambari too many time check manually"
+                exit 1
+            fi
+        fi
+    fi
+    
+    
+    # if pid missing or check with checking for process
+    # /usr/jdk64/jdk1.7.0_45/bin/java -server -XX:NewRatio=3 -XX:+UseConcMarkSweepGC -XX:-UseGCOverheadLimit -XX:CMSInitiatingOccupancyFraction=60 -Xms512m -Xmx2048m -Djava.security.auth.login.config=/etc/ambari-server/conf/krb5JAASLogin.conf -Djava.security.krb5.conf=/etc/krb5.conf -Djavax.security.auth.useSubjectCredsOnly=false -cp /etc/ambari-server/conf:/usr/lib/ambari-server/*:/usr/lib64/qt-3.3/bin:/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin:/root/bin:/usr/lib/ambari-server/*:/usr/share/java/mysql-connector-java.jar:/usr/share/java/mysql-connector-java-5.1.17.jar org.apache.ambari.server.controller.AmbariServer
+    
+    
+if [[ "$CLUSTER_STATUS" == "000" ]] ; then
+        if [ ${REMOTE:-false} == "false" ] ; then  
+            if [ $clean_spin -eq 1 ] ; then
+                printf "\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b"
+            fi
+            local temp=${spinstr#?}
+            printf "no response from server - [%c]  " "$spinstr"
+            local spinstr=$temp${spinstr%"$temp"}
+            clean_spin=1
+        else 
+            echo "<no response from server, continue to poll> (seconds: $LOOP_SECONDS)"
+        fi
+elif [ "$CLUSTER_STATUS" == "200" ] ; then
+    # Success and test for CLUSTER_RESULTS_STATUS (IN_PROGRESS,FAILED,COMPLETED)
+    echo "Successful call (seconds: $LOOP_SECONDS) - current status:$CLUSTER_RESULTS_STATUS"
+    
+    if [ "$CLUSTER_RESULTS_STATUS" == "COMPLETED" ] || [ "$CLUSTER_RESULTS_STATUS" == "FAILED" ] ; then
+        if [ "$CLUSTER_RESULTS_STATUS" == "COMPLETED" ] ; then
+            echo "Done - Point browser to localhost:8080 and log in as admin:admin to use Ambari - Enjoy your cluster - NeverwinterDP Team - http://www.neverwinterdp.com"
+            exit 0
+        fi
+        if [ "$CLUSTER_RESULTS_STATUS" == "FAILED" ] ; then
+            echo "$CLUSTER_TASK_RESULTS"
+            echo "It failed you'll need to investigate. Point browser to localhost:8080 and log in as admin:admin."
+            exit 1
+        fi
+    fi
+    
+elif [ "$CLUSTER_STATUS" == "403" ] ; then
+    # Check error message
+    MSG="\nGot a 403 response so is probably a authentication problem.\n\n"
+    printf "$MSG"
+    echo "$CLUSTER_RESULTS" | grep message | awk '{print $3}' | tr -d [\"]
+    exit 1
+elif [ "$CLUSTER_STATUS" == "404" ] ; then
+    MSG="\nGot a 404 response so is probably a bad query call.\n\n"
+    printf "$MSG"
+    echo "$CLUSTER_RESULTS" | grep message | awk '{print $3}' | tr -d [\"]
+    exit 1
+elif [ "${CLUSTER_STATUS:0:1}" == "2" ] ; then
+    MSG="\nGot a 2XX response so should be good.\n\n"
+    printf "$MSG"
+    
+    echo "$CLUSTER_RESULTS"
+    
+    printf "$MSG"
+    echo "Ending Loop"
+    exit 1
+    
+elif [ "${CLUSTER_STATUS:0:1}" == "4" ] ; then
+    MSG="\nGot a 4XX response so there is probably a problem.\n\n"
+    printf "$MSG"
+    
+    echo "$CLUSTER_RESULTS"
+    
+    printf "$MSG"
+    exit 1
+else
+    MSG="\nGot a unknown response so there is probably a problem.\n\n"
+    printf "$MSG"
+    echo "CLUSTER_RESULTS: ${CLUSTER_RESULTS}"
+    echo "HTTP_STATUS: ${CLUSTER_STATUS}"
+    echo "JSON_RESPONSE_STATUS: ${CLUSTER_RESULTS_STATUS}"
+fi
+
+let "LOOP_SECONDS=$LOOP_SECONDS+1"
+
+sleep 1
+
+done
+
+
+# {
+#   "href" : "http://localhost:8080/api/v1/clusters/cl1/requests/1",
+#   "Requests" : {
+#     "aborted_task_count" : 0,
+#     "cluster_name" : "cl1",
+#     "completed_task_count" : 0,
+#     "create_time" : 1402883226676,
+#     "end_time" : -1,
+#     "failed_task_count" : 0,
+#     "id" : 1,
+#     "inputs" : null,
+#     "progress_percent" : 4.757575757575758,
+#     "queued_task_count" : 31,
+#     "request_context" : "Install and start all services",
+#     "request_schedule" : null,
+#     "request_status" : "IN_PROGRESS",
+#     "resource_filters" : [ ],
+#     "start_time" : 1402883226951,
+#     "task_count" : 66,
+#     "timed_out_task_count" : 0,
+#     "type" : "INTERNAL_REQUEST"
+#   }
+# }
+
+#  echo "$CLUSTER_RESULTS"
+# {
+#   "status" : 404,
+#   "message" : "Request resource doesn't exist."
+# }
+
+# curl: (6) Couldn't resolve host '%http_code'
+# {
+#   "status": 403,
+#   "message": "Full authentication is required to access this resource"
+# }
+
+# [root@test2 ~]# curl -s -uadmin:admin http://localhost:8080/api/v1/clusters/cl1/requests/1?fields=Requests/request_status
+# {
+#   "href" : "http://localhost:8080/api/v1/clusters/cl1/requests/1",
+#   "Requests" : {
+#     "cluster_name" : "cl1",
+#     "id" : 1,
+#     "request_status" : "IN_PROGRESS"
+#   }
+# }
+
+# [root@ip-10-233-133-34 ~]# curl -s -uadmin:admin http://localhost:8080/api/v1/clusters/cl1/requests/1?fields=Requests/request_status
+# {
+#   "status" : 404,
+#   "message" : "Request resource doesn't exist."
+# }
+
+# [vagrant@sparkngin1 ~]$ curl -s -uadmin:admin http://localhost:8080/api/v1/clusters/cl1/requests/1?fields=Requests/request_status
+# {
+#   "href" : "http://localhost:8080/api/v1/clusters/cl1/requests/1",
+#   "Requests" : {
+#     "cluster_name" : "cl1",
+#     "id" : 1,
+#     "request_status" : "FAILED"
+#   }
+# }
+
+
+
+
+
+
+
+# [root@ip-10-36-3-46 ~]# curl -v -X POST -d @$TMP_DIR/cluster-creation.json http://admin:admin@localhost:8080/api/v1/clusters/cl1 --header "Content-Type:application/json" --header "X-Requested-By:mycompany"
+# * About to connect() to localhost port 8080 (#0)
+# *   Trying 127.0.0.1... connected
+# * Connected to localhost (127.0.0.1) port 8080 (#0)
+# * Server auth using Basic with user 'admin'
+# > POST /api/v1/clusters/cl1 HTTP/1.1
+# > Authorization: Basic YWRtaW46YWRtaW4=
+# > User-Agent: curl/7.19.7 (x86_64-redhat-linux-gnu) libcurl/7.19.7 NSS/3.14.0.0 zlib/1.2.3 libidn/1.18 libssh2/1.4.2
+# > Host: localhost:8080
+# > Accept: */*
+# > Content-Type:application/json
+# > X-Requested-By:mycompany
+# > Content-Length: 251
+# > 
+# < HTTP/1.1 400 Bad Request
+# < Set-Cookie: AMBARISESSIONID=1loev1y9bqi551lcirxdyqs21q;Path=/
+# < Expires: Thu, 01 Jan 1970 00:00:00 GMT
+# < Content-Type: text/plain
+# < Content-Length: 178
+# < Server: Jetty(7.6.7.v20120910)
+# < 
+# {
+#   "status" : 400,
+#   "message" : "Attempted to add unknown hosts to a cluster.  These hosts have not been registered with the server: ip-10-36-3-46.us-west-2.compute.internal"
+# * Connection #0 to host localhost left intact
+# * Closing connection #0
+# }
+
+
+# [root@ip-10-36-19-68 ~]# curl -uadmin:admin http://localhost:8080/api/v1/hosts
+# {
+#   "href" : "http://localhost:8080/api/v1/hosts",
+#   "items" : [
+#     {
+#       "href" : "http://localhost:8080/api/v1/hosts/ip-10-36-19-68.us-west-2.compute.internal",
+#       "Hosts" : {
+#         "host_name" : "ip-10-36-19-68.us-west-2.compute.internal"
+#       }
+#     }
+#   ]
+# }
